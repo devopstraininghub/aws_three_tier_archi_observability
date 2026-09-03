@@ -67,10 +67,10 @@ terraform {
   # real HCL limitation), so this can only ever be kept correct by exactly that
   # kind of external patch, not a `var.foo` reference.
   backend "s3" {
-    bucket               = ""
+    bucket               = "bookstore-terraform-state-905221885307"
     key                  = "terraform.tfstate"
     workspace_key_prefix = "environments"
-    region               = ""
+    region               = "us-west-1"
     use_lockfile         = true
     encrypt              = true
   }

@@ -18,9 +18,9 @@ spec:
   ingressClassName: alb
   tls:
     - hosts:
-        - bookstore.b17catsvsdogs.xyz
+        - bookstore.b17facebook.xyz
   rules:
-    - host: bookstore.b17catsvsdogs.xyz
+    - host: bookstore.b17facebook.xyz
       http:
         paths:
           - path: /
