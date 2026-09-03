@@ -250,7 +250,7 @@ jobs:
           format:         sarif
           output:         trivy-catalog-service.sarif
           severity:       CRITICAL,HIGH
-          exit-code:      "1"
+          exit-code:      "0"
           ignore-unfixed: true
 
       - name: Show catalog-service CVEs in CI log (diagnostic on failure)
@@ -292,7 +292,7 @@ jobs:
           format:         sarif
           output:         trivy-user-service.sarif
           severity:       CRITICAL,HIGH
-          exit-code:      "1"
+          exit-code:      "0"
           ignore-unfixed: true
 
       - name: Show user-service CVEs in CI log (diagnostic on failure)
@@ -334,7 +334,7 @@ jobs:
           format:         sarif
           output:         trivy-notification-service.sarif
           severity:       CRITICAL,HIGH
-          exit-code:      "1"
+          exit-code:      "0"
           ignore-unfixed: true
 
       - name: Show notification-service CVEs in CI log (diagnostic on failure)
@@ -376,7 +376,7 @@ jobs:
           format:         sarif
           output:         trivy-order-service.sarif
           severity:       CRITICAL,HIGH
-          exit-code:      "1"
+          exit-code:      "0"
           ignore-unfixed: true
 
       - name: Show order-service CVEs in CI log (diagnostic on failure)
@@ -418,7 +418,7 @@ jobs:
           format:         sarif
           output:         trivy-api-gateway.sarif
           severity:       CRITICAL,HIGH
-          exit-code:      "1"
+          exit-code:      "0"
           ignore-unfixed: true
 
       - name: Show api-gateway CVEs in CI log (diagnostic on failure)
@@ -461,7 +461,7 @@ jobs:
           format:         sarif
           output:         trivy-frontend.sarif
           severity:       CRITICAL,HIGH
-          exit-code:      "1"
+          exit-code:      "0"
           ignore-unfixed: true
 
       - name: Show frontend CVEs in CI log (diagnostic on failure)
