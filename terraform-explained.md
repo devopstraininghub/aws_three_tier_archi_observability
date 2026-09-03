@@ -227,4 +227,4 @@ Reverse of apply, plus two deliberate safety nets that only run `when = destroy`
 - `null_resource.delete_ingress_objects` (in `eks-addons`) — deletes Ingress objects before the VPC destroy reaches them, so the ALB's finalizer doesn't hang the whole destroy.
 - `null_resource.cleanup_eks_networking` (root `main.tf`) — cleans up orphaned VPC CNI ENIs + the EKS-auto-created cluster security group, after `module.eks` is gone but before `module.network`'s VPC/subnets.
 
-Both exist because EKS and its controllers create real AWS resources directly via the EC2 API, entirely outside Terraform's own graph — Terraform has no way to know about them, let alone clean them up on its own.
+...Both exist because EKS and its controllers create real AWS resources directly via the EC2 API, entirely outside Terraform's own graph — Terraform has no way to know about them, let alone clean them up on its own.
