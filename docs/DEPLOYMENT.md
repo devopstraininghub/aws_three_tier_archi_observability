@@ -1,43 +1,63 @@
 # Deployment
 
-How to actually stand this project up, end to end, from a fresh AWS account. This is the "nothing exists yet" path (verified 2026-07-31: `aws eks describe-cluster --name bookstore-eks` returns `ResourceNotFoundException` — nothing is running, despite a stale local `kubectl` context suggesting otherwise. Always verify against AWS directly, never trust a cached kubeconfig).
+Friends, in this document we will build the whole Bookstore project **from zero**, on a fresh AWS account, step by step. Follow the steps in order. Do not skip any. Simple only.
 
-> All Terraform (`*.tf`, `modules/`, `environments/`) lives under `terraform/`, not repo root — every raw `terraform` command below runs from inside that directory (`cd terraform` first). `make plan`/`make apply`/`make destroy` from repo root handle this automatically (`Makefile` uses `terraform -chdir=terraform`), if you'd rather not `cd` by hand.
+**Before anything else — one golden habit:**
+- Always check AWS directly to see what exists. Do not trust your old `kubectl` setup.
+- A stale kubeconfig can say a cluster is there when it was deleted weeks ago.
+- Quick check: `aws eks describe-cluster --name bookstore-eks`. If it says `ResourceNotFoundException`, nothing is running.
+
+> All Terraform files live inside the `terraform/` folder. Run raw `terraform` commands from there (`cd terraform` first). Or use `make plan` / `make apply` / `make destroy` from the repo root. The Makefile does `terraform -chdir=terraform` for you.
+
+---
 
 ## Contents
 
 - [Before you start](#before-you-start)
-- [Step 1 — Fill in your config, generate `terraform.tfvars`](#step-1--fill-in-your-config-generate-terraformtfvars)
-- [Step 2 — Bootstrap Terraform state](#step-2--bootstrap-terraform-state-once-per-aws-account)
-- [Step 3 — Bootstrap the domain](#step-3--bootstrap-the-domain-once-per-domain-ever)
-- [Step 4 — One apply, everything](#step-4--one-apply-everything)
-- [Step 5 — Configure GitHub Secrets & Variables](#step-5--configure-github-secrets--variables-for-cicd)
-- [Step 6 — Import known-conflicting entries](#step-6--import-known-conflicting-entries-if-re-deploying)
-- [Step 7 — Confirm the ExternalSecrets IRSA fix](#step-7--confirm-the-externalsecrets-irsa-fix-actually-took)
-- [Step 8 — Watch all apps come up](#step-8--watch-all-apps-come-up)
-- [Ongoing deploys](#ongoing-deploys-once-the-initial-stand-up-is-done)
+- [Step 1 — Config file](#step-1--fill-in-your-config-and-generate-terraformtfvars)
+- [Step 2 — Terraform state bucket](#step-2--bootstrap-terraform-state-once-per-aws-account)
+- [Step 3 — Domain](#step-3--bootstrap-the-domain-once-per-domain-ever)
+- [Step 4 — One apply](#step-4--one-apply-everything)
+- [Step 5 — GitHub secrets](#step-5--configure-github-secrets-and-variables)
+- [Step 6 — Import old entries](#step-6--import-known-conflicting-entries-only-if-re-deploying)
+- [Step 7 — Check secrets sync](#step-7--check-that-secret-syncing-works)
+- [Step 8 — Watch apps come up](#step-8--watch-all-apps-come-up)
+- [Ongoing deploys](#ongoing-deploys)
 - [Monitoring access](#monitoring-access)
 - [Tearing it down](#tearing-it-down)
-- [Related](#related)
+- [Troubleshooting cheat sheet](#troubleshooting-cheat-sheet)
+
+---
 
 ## Before you start
 
-**Required tooling:**
+### What you need
 
-- AWS credentials configured (`aws sts get-caller-identity` should work) with permissions to create VPCs, EKS clusters, RDS instances, IAM roles, etc.
-- `terraform` >= 1.10.0 (native S3 state locking needs it), `kubectl`, `aws` CLI, and `python3` — all four on `PATH` on whatever machine runs `terraform apply`.
-  > Every `local-exec` provisioner in this Terraform config invokes `python3` directly (`interpreter = ["python3"]`, not a shell) to run a real script from `scripts/` — ALB hostname discovery, SES SMTP password derivation, destroy-time Ingress/flow-log-group cleanup — so it behaves identically on Windows, macOS, and Linux instead of assuming a bash-compatible shell exists. `helm` itself isn't needed on your machine — the `helm` Terraform provider talks to the Helm API directly, no CLI required.
-- A domain you control (for `terraform.tfvars`' `domain` value — ACM DNS validation needs it).
+- An **AWS account** and working credentials. Test with `aws sts get-caller-identity`.
+- Permissions to create VPCs, EKS clusters, RDS, IAM roles, and more.
+- These four tools on your `PATH`: `terraform` (1.10.0 or newer), `kubectl`, `aws` CLI, and `python3`.
+- A **domain name** you control. ACM needs it to validate the certificate.
 
-**Check the toolchain first:**
+**Why Python?**
+- Every helper step in Terraform (`local-exec`) runs a real Python script from `scripts/`.
+- It runs the same on Windows, macOS, and Linux. No special bash needed.
+- You do **not** need the `helm` CLI. Terraform's Helm provider talks to Helm directly.
+
+### Run the preflight check
 
 ```bash
 python3 scripts/preflight.py
 ```
 
-Verifies all four tools are on `PATH` and new enough (`terraform` >= 1.10.0), that `aws sts get-caller-identity` works, and that `config.env` has its 5 required keys. Report only — it never installs anything or touches `PATH`; on a failure it prints the install command for your OS and exits non-zero. `make plan` and `make apply` run it automatically as a prerequisite, so a missing or old tool fails here with a clear message instead of deep inside an apply (usually `null_resource.wait_for_alb_hostname`).
+- Checks that all four tools exist and are new enough.
+- Checks your AWS login works.
+- Checks `config.env` has its 5 required keys.
+- **Only reports.** It never installs anything.
+- `make plan` and `make apply` run it for you.
 
-**One-time GitHub OIDC provider** (not a Terraform resource — `iam.tf`'s trust policy just references its ARN by string, so Terraform never checks it exists):
+### One-time GitHub OIDC provider
+
+This is **not** created by Terraform. You do it once per AWS account.
 
 ```bash
 aws iam create-open-id-connect-provider \
@@ -46,37 +66,52 @@ aws iam create-open-id-connect-provider \
   --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
 ```
 
-Safe to skip if it already exists — `aws iam list-open-id-connect-providers` to check first; the create call fails loudly (`EntityAlreadyExists`) if you skip that check and run it twice.
+- Check first with `aws iam list-open-id-connect-providers`.
+- If it already exists, running it again fails with `EntityAlreadyExists`. Harmless, but skip it.
 
-> **Time & cost:** expect roughly 20-30 minutes, and real money the moment RDS/EKS/the monitoring EC2 exist. Don't run `terraform apply` on the full stack "just to see what happens." This branch removed some unnecessary serialization in the Terraform graph — RDS/EKS already ran concurrently, but `eks-addons`'s 5 Helm charts now all install concurrently instead of partly one-after-another, and `monitoring-ec2` no longer waits on all of `eks-addons` to finish. See [`ARCHITECTURE.md`](ARCHITECTURE.md#terraform-module-graph). Not yet verified against a real apply — if a Helm release in `eks-addons` times out, check `terraform apply`'s own error output for which chart failed and re-run; Helm releases here are idempotent, so a re-apply picks up where it left off.
+### Time and money
 
-## Step 1 — Fill in your config, generate `terraform.tfvars`
+> ⚠️ Expect **20 to 30 minutes**, and **real money** as soon as RDS, EKS, and the monitoring EC2 exist. Never run the full `terraform apply` "just to see what happens".
+
+- RDS takes 10–15 minutes. EKS takes 15–20 minutes. They build **at the same time**.
+- The Helm add-ons also install at the same time now.
+- If a Helm release times out, read the error to see which chart failed, then run `apply` again. Helm releases here are safe to retry.
+
+---
+
+## Step 1 — Fill in your config and generate `terraform.tfvars`
 
 ```bash
 cp config.env.example config.env
 # edit config.env: AWS_ACCOUNT_ID, AWS_REGION, DOMAIN, GITHUB_REPO, ALERT_EMAIL
-# (GITHUB_BRANCH and SECONDARY_REGION are optional -- default to "main"
-# and "us-west-2" respectively if left unset)
+# (GITHUB_BRANCH and SECONDARY_REGION are optional — they default to "main" and "us-west-2")
 python3 scripts/configure.py
 ```
 
-Do this **before** Step 2 — Step 2's backend bootstrap reads `AWS_REGION` from this same `config.env` file, so it needs to exist first (see Step 2's own notes on region resolution).
+**Do this first**, before Step 2. The state-bucket script reads your region from `config.env`.
 
-> **Any AWS region works here**, not just `us-west-1` — AZs (`locals.tf`), the ECR registry URL, and the `ClusterSecretStore`'s region are all derived from `AWS_REGION`/`var.aws_region`, nothing left hardcoded. If you set `AWS_REGION` to anything other than `us-west-1`, also set a matching `AWS_REGION` repo **Variable** in GitHub (Settings → Secrets and variables → Actions → **Variables** tab, not Secrets — the region isn't sensitive). `.github/workflows/ci-cd.yml`, `terraform.yml`, and `terraform-drift.yml` all fall back to `us-west-1` if that Variable isn't set, which would build/push images and run `terraform plan`/`apply` against the wrong region.
+**Any AWS region works,** not just `us-west-1`. Zones, ECR address, and the secret store region all come from `AWS_REGION`.
+- If you use a different region, also add a GitHub **Variable** called `AWS_REGION` (Settings → Secrets and variables → Actions → **Variables** tab).
+- If you forget, CI falls back to `us-west-1` and builds in the wrong region.
 
-`terraform.tfvars` is **generated, not hand-written** — `scripts/configure.py` is the only supported way to produce it (also stated on `alert_email`'s own description in `variables.tf`: "don't hand-edit it here directly"). The script does two things:
-
-1. **Writes `terraform.tfvars`** with the 4 variables that have no safe default (`aws_region`, `domain`, `github_repo`, `alert_email`) — everything else in `variables.tf` ships with a working default. Leave `primary_alb_dns` and `secondary_alb_dns` out of `config.env` entirely:
-   - `primary_alb_dns` is auto-discovered within the same apply now (see Step 4) — only set it by hand afterward if you want to override discovery and point DNS at a different/manually-managed load balancer.
-   - `secondary_alb_dns` stays empty until a secondary-region EKS cluster actually exists (it doesn't yet — see [`ARCHITECTURE.md`](ARCHITECTURE.md#region-layout)).
-2. **Stamps your real domain/repo/account ID/region** over placeholder values (`YOUR_DOMAIN_HERE.com`, `YOUR_GITHUB_USERNAME/aws_three_tier_code`, `ACCOUNT_ID`, `AWS_REGION_HERE`) in five checked-in template files:
+**What `configure.py` does:**
+1. Writes `terraform.tfvars` with the four values that have no safe default: `aws_region`, `domain`, `github_repo`, `alert_email`.
+2. Replaces placeholder text (`YOUR_DOMAIN_HERE.com`, `ACCOUNT_ID`, and so on) in five checked-in files:
    - `k8s/base/ingress/ingress.yaml`
-   - `k8s/services/api-gateway/base/configmap.yaml` (`FRONTEND_URL`, used for CORS)
+   - `k8s/services/api-gateway/base/configmap.yaml` (the CORS `FRONTEND_URL`)
    - `k8s/argocd/application.yaml`
    - `k8s/overlays/prod/kustomization.yaml`
-   - `k8s/base/secrets/external-secret.yaml` (the shared `ClusterSecretStore`'s `region` field — every service's `ExternalSecret` references this one by name, so a wrong region here breaks secret sync cluster-wide)
+   - `k8s/base/secrets/external-secret.yaml` (the secret store region)
 
-**Commit and push those 5 stamped files before your first ArgoCD sync matters** — ArgoCD deploys `k8s/base` and `k8s/services` content straight from git, not from whatever's sitting on your local disk. Skip this and the very first sync deploys the literal placeholder strings, not your real domain:
+**Do not hand-write `terraform.tfvars`.** Always generate it with this script.
+
+Leave `primary_alb_dns` and `secondary_alb_dns` out of `config.env`:
+- `primary_alb_dns` is found automatically during the apply.
+- `secondary_alb_dns` stays empty until a second-region cluster exists (it does not yet).
+
+### Commit and push those five files
+
+ArgoCD deploys from **Git**, not from your laptop. If you skip this, the first sync deploys the placeholder text instead of your real domain.
 
 ```bash
 git add k8s/base/ingress/ingress.yaml k8s/services/api-gateway/base/configmap.yaml \
@@ -86,9 +121,11 @@ git commit -m "chore: configure for <your-domain>"
 git push
 ```
 
-> `k8s/argocd/application.yaml` itself is read directly off local disk by `argocd.tf`'s `kubectl_manifest` resource at `terraform apply` time — pushing it isn't strictly required for that one apply to pick up the right value, but commit it anyway so the checked-in file matches what's actually running.
+`config.env` and `terraform.tfvars` are both gitignored. **Never commit them.**
 
-`config.env` and `terraform.tfvars` are both gitignored — never commit either one.
+**Easy memory trick:** config.env → configure.py → five stamped files → push them.
+
+---
 
 ## Step 2 — Bootstrap Terraform state (once per AWS account)
 
@@ -96,17 +133,21 @@ git push
 python3 scripts/init_backend.py
 ```
 
-Creates the S3 bucket, patches `versions.tf` in place with the real bucket name *and region*, runs `terraform init`. State locking is native S3 conditional-write locking (`use_lockfile = true`, no DynamoDB table).
+- Creates the S3 bucket that stores the Terraform state.
+- Writes the real bucket name and region into `versions.tf`.
+- Runs `terraform init`.
+- Locking is native S3 locking (`use_lockfile = true`). No DynamoDB table needed.
 
-> Skipping this step means Terraform silently uses local state — `terraform plan` will look like it wants to create everything from scratch even if a cluster is already running elsewhere, because local state has no idea what exists. **If a `terraform plan` ever shows a suspiciously large "to add" count, check `terraform state list` and confirm the backend is actually configured before doing anything else.**
+> ⚠️ If you skip this, Terraform quietly uses **local state**. Then `terraform plan` thinks nothing exists and wants to create everything again. If a plan ever shows a suspiciously large "to add" count, check `terraform state list` and confirm the backend is configured.
 
-Region resolution here is layered, in priority order:
+**Which region does it use?** In this order:
+1. A region you pass on the command line (`python3 scripts/init_backend.py us-west-2`).
+2. `AWS_REGION` from `config.env`.
+3. `us-west-1` as the last fallback.
 
-1. An explicit CLI arg (`python3 scripts/init_backend.py us-west-2`, if you want to override)
-2. `AWS_REGION` from `config.env` (the normal path, since Step 1 already created it)
-3. `us-west-1` as a last-resort default if neither is set
+**Why a script?** The backend block in `versions.tf` cannot use variables. Terraform reads it before it reads variables. So the script writes the literal value in.
 
-The Terraform backend block in `versions.tf` genuinely cannot reference `var.aws_region` at all — Terraform resolves backend configuration before any variables are evaluated, a real HCL limitation, not an oversight — so this script patching the literal value in is the only way that field ever stays correct.
+---
 
 ## Step 3 — Bootstrap the domain (once per domain, ever)
 
@@ -114,91 +155,133 @@ The Terraform backend block in `versions.tf` genuinely cannot reference `var.aws
 python3 scripts/init_domain.py
 ```
 
-Creates the public Route53 hosted zone for `DOMAIN` (from `config.env`) if it doesn't already exist, and prints the 4 NS values to set at your registrar (GoDaddy, Namecheap, etc.).
+- Creates the public Route 53 hosted zone for your `DOMAIN` if it does not exist.
+- Prints **four NS (nameserver) values**.
+- Go to your registrar (GoDaddy, Namecheap, and so on) and set those four NS values.
 
-**Do this now, before Step 4** — Terraform reads this zone via a `data` lookup, it never creates or destroys it, so the registrar update only ever needs to happen once for this domain's whole lifetime, not once per apply/destroy cycle. Set the NS values now and give them a few minutes to propagate while Step 4 works through the rest of the stack; if `aws_acm_certificate_validation.ingress` still hangs in Step 4, the NS records haven't propagated yet.
+**Do this now,** before Step 4:
+- Terraform only **looks up** this zone. It never creates or destroys it.
+- So you set the registrar once for the lifetime of the domain.
+- DNS needs a few minutes to spread. Doing it early lets that time overlap with the build.
+- If `aws_acm_certificate_validation.ingress` hangs in Step 4, the NS records have not spread yet. Just wait.
+
+**Real-time example:** Same idea as the Route 53 class — the domain is bought on GoDaddy, and you delegate it to AWS with NS records.
+
+---
 
 ## Step 4 — One apply, everything
 
 ```bash
 cd terraform
 terraform plan -out=tfplan
-# review it — expect ~145 resources on a genuinely fresh account:
-#   VPC + subnets + NAT + IGW + S3 endpoint, security groups, 2 ACM certs
-#   (CloudFront's, off by default, + the real one the ALB uses), RDS instance,
-#   private Route53 zone (the public zone is looked up, not created — see Step 3),
-#   ECR repos, EKS cluster + node group + OIDC provider,
-#   eks-addons (ESO, AWS Load Balancer Controller, ArgoCD, Argo Rollouts),
+# read the plan! On a fresh account expect about 145 resources:
+#   VPC, subnets, NAT, IGW, S3 endpoint, security groups, ACM certificates,
+#   RDS, private Route 53 zone, ECR repos, EKS cluster + nodes + OIDC,
+#   eks-addons (ESO, ALB controller, ArgoCD, Argo Rollouts),
 #   monitoring EC2 + EIP, GitHub OIDC role,
-#   the ArgoCD AppProject + Application + ApplicationSet (kubectl_manifest, see below)
+#   ArgoCD AppProject + Application + ApplicationSet
 terraform apply tfplan
 ```
 
-> **Why one apply instead of two:** this used to need a second apply — Terraform couldn't create the public Route53 record until it knew the ingress load balancer's hostname, and that didn't exist until after `eks-addons` finished, so you had to check it by hand, paste it into `terraform.tfvars`, and apply again. `argocd.tf`'s `data "kubernetes_ingress_v1" "bookstore"` now reads that hostname within the same apply, gated behind a `null_resource` that first polls for the `bookstore-ingress` Ingress object to exist at all (it's deployed by ArgoCD, asynchronously — not created directly by this apply the way ingress-nginx's Helm-installed Service used to be), then `kubectl wait --for=jsonpath=...` for the AWS Load Balancer Controller to finish provisioning the real ALB and populate its hostname. One apply, start to finish, just with a wider safety-margin timeout than the old single-stage wait needed.
+**Why one apply and not two?**
+- Before, Terraform could not create the DNS record until the load balancer existed.
+- So you had to apply, copy the ALB name by hand, paste it, and apply again.
+- Now `argocd.tf` finds the ALB name **inside the same apply**.
+- A helper script first waits for the `bookstore-ingress` Ingress to appear (ArgoCD creates it, on its own schedule). Then it waits for the AWS Load Balancer Controller to fill in the ALB hostname.
+- Then Terraform reads that hostname and creates the Route 53 records.
 
-`argocd.tf` also applies `k8s/argocd/appproject.yaml`, `k8s/argocd/application.yaml`, and `k8s/argocd/applicationset-microservices.yaml` directly (via the `kubectl_manifest` resource, `gavinbunney/kubectl` provider) — no more manual `kubectl apply -f k8s/argocd/...` after the fact. All three wait on `module.eks_addons` (they need ArgoCD's CRDs to exist); the Application and ApplicationSet additionally wait on the AppProject, since ArgoCD rejects either one naming a project that doesn't exist.
+**`argocd.tf` also applies three manifests for you:**
+- `k8s/argocd/appproject.yaml`
+- `k8s/argocd/application.yaml`
+- `k8s/argocd/applicationset-microservices.yaml`
 
-RDS (~10-15 min) and EKS (~15-20 min) are the slow parts and provision concurrently, since neither depends on the other directly (both depend on `network`/`security`, not on each other). The `eks-addons` Helm releases run after the cluster is up, now fully concurrently with each other too (see [`ARCHITECTURE.md`](ARCHITECTURE.md#terraform-module-graph)). As long as Step 3's NS records were set and have propagated, `aws_acm_certificate_validation.ingress` resolves on its own within a few minutes — no manual registrar step here anymore (that used to be required after *every* destroy+recreate cycle, since the public zone was Terraform-managed and got brand-new NS values each time it was recreated; it's now a `data` lookup instead, see Step 3).
+So **no manual `kubectl apply -f k8s/argocd/...`** is needed. They wait for `eks-addons` (they need ArgoCD's CRDs). The Application and ApplicationSet also wait for the AppProject, because ArgoCD rejects an app that names a project that does not exist.
 
-## Step 5 — Configure GitHub Secrets & Variables for CI/CD
+**If it seems stuck:** the certificate step waits for DNS. Make sure Step 3's NS values are set at your registrar.
 
-Nothing in `.github/workflows/` works until these exist — every push fails predictably at the AWS-auth step otherwise, on a genuinely fresh repo. `AWS_ROLE_ARN` names the `aws_iam_role.github_oidc` role Step 4's apply just created (using *your own* local AWS CLI credentials — CI has no way to bootstrap that role itself, since it needs the role to authenticate in the first place). The OIDC identity provider that role's trust policy points at is already in place too, from **Before you start**. From here on, every CI-driven apply uses OIDC — no static AWS keys ever touch GitHub.
+**Easy memory trick:** Step 4 = plan, read, apply. Never apply blind.
+
+---
+
+## Step 5 — Configure GitHub secrets and variables
+
+Nothing in `.github/workflows/` works until these exist. Without them, every push fails at the AWS login step.
+
+**Why now?** The `AWS_ROLE_ARN` role is created by Step 4 using *your* local AWS login. CI cannot create its own role, because it needs that role to log in at all. After this, CI uses OIDC with no static keys.
 
 In GitHub: **Settings → Secrets and variables → Actions**.
 
-**Secrets** tab:
+**Secrets tab:**
 
 | Secret | Value |
 |---|---|
 | `AWS_ACCOUNT_ID` | `aws sts get-caller-identity --query Account --output text` |
-| `AWS_ROLE_ARN` | `terraform output -raw github_oidc_role_arn` — only exists after Step 4's apply |
+| `AWS_ROLE_ARN` | `terraform output -raw github_oidc_role_arn` (only exists after Step 4) |
 | `API_URL` | `https://api.bookstore.<your-domain>` |
 | `SONAR_TOKEN` | sonarcloud.io → My Account → Security |
 | `SONAR_ORGANIZATION` | your SonarCloud org key |
 | `SONAR_PROJECT_KEY` | your SonarCloud project key |
 
-**Variables** tab (not sensitive — skip entirely if deploying to `us-west-1`):
+**Variables tab** (not secret — skip it if you use `us-west-1`):
 
 | Variable | Value |
 |---|---|
-| `AWS_REGION` | must match `config.env`'s `AWS_REGION` from Step 1, or CI defaults to `us-west-1` regardless of where Terraform actually provisioned |
+| `AWS_REGION` | Must match `AWS_REGION` in `config.env` |
 
-> Until all the Secrets above exist, expect exactly two failures on every push, both normal for a fresh repo: `Terraform CI/CD` fails at "Configure AWS credentials (OIDC)" (no `AWS_ROLE_ARN` yet), and `DevSecOps Pipeline` fails at the SonarCloud step (no `SONAR_TOKEN` yet). Neither is a region problem or a code problem — just missing secrets.
+> Until all secrets exist, expect **exactly two failures** on each push. Both are normal on a fresh repo:
+> - `Terraform CI/CD` fails at "Configure AWS credentials (OIDC)" — no `AWS_ROLE_ARN` yet.
+> - `DevSecOps Pipeline` fails at the SonarCloud step — no `SONAR_TOKEN` yet.
+>
+> It is not a code problem. Just missing secrets.
 
-## Step 6 — Import known-conflicting entries (if re-deploying)
+---
 
-Only needed if this isn't a truly fresh account — a lost or switched Terraform state backend (e.g. pointing `init_backend.py` at a different S3 bucket than a previous session used) can leave entries in AWS that the *current* state doesn't know about, even though a real `terraform destroy` against the *correct* state cleans all of them up properly: three Secrets Manager secrets (`/bookstore/db-credentials`, `/bookstore/grafana-admin`, `/bookstore/jwt-secret`) plus the SES email identity for `ALERT_EMAIL`. Confirmed live 2026-08-26 against an account with two different state buckets from past testing — an apply against the "wrong" one hit `AlreadyExistsException` on `aws_sesv2_email_identity.alerts`:
+## Step 6 — Import known-conflicting entries (only if re-deploying)
+
+**Do you need this?** Only if the account is **not** truly fresh. For example, you changed the state bucket between sessions.
+
+**What goes wrong:** Terraform's current state does not know about things AWS already has. The apply then fails with `AlreadyExistsException`. The usual ones:
+- Three Secrets Manager secrets: `/bookstore/db-credentials`, `/bookstore/grafana-admin`, `/bookstore/jwt-secret`.
+- The SES email identity for your `ALERT_EMAIL`.
 
 ```bash
 make import
 ```
 
-Safe no-op on a genuinely fresh account (`|| echo already in state` on each).
+- Safe on a fresh account. Each line ends with `|| echo already in state`, so nothing breaks.
 
-## Step 7 — Confirm the ExternalSecrets IRSA fix actually took
+**Easy memory trick:** Fresh account = skip. Re-deploy with lost state = `make import`.
 
-This bit silently broke every secret sync in the cluster until fixed on this branch (see [`ARCHITECTURE.md`](ARCHITECTURE.md#secrets-flow-and-the-bug-that-used-to-break-it)) — don't skip verifying it:
+---
+
+## Step 7 — Check that secret syncing works
+
+This bug once broke **every** secret sync in the cluster without any loud error. So please do not skip this check. (The story is in [`ARCHITECTURE.md`](ARCHITECTURE.md), section 8.)
 
 ```bash
 kubectl get serviceaccount external-secrets-sa -n external-secrets -o jsonpath='{.metadata.annotations}'
 # should contain: "eks.amazonaws.com/role-arn":"arn:aws:iam::<account>:role/bookstore-external-secrets"
 
 kubectl get clustersecretstore aws-secretsmanager -o jsonpath='{.status.conditions[0]}'
-# should show "status":"True","type":"Ready" -- if this isn't Ready, every
-# ExternalSecret below will fail regardless of anything else being correct,
-# since they all reference this one ClusterSecretStore by name
+# should show "status":"True","type":"Ready"
+# If this is not Ready, every ExternalSecret will fail,
+# because they all use this one store.
 
 kubectl get externalsecret admin-db-secret -n catalog
-# STATUS column should show SecretSynced, not an error -- every microservice
-# (catalog/user/order/notification/gateway) has its own admin-db-secret,
-# this one's just picked as the first to check
+# STATUS should be SecretSynced, not an error.
+# Every service namespace has its own admin-db-secret; catalog is just the first to check.
 ```
+
+**What each check means:**
+- ServiceAccount has the role annotation → ESO is allowed to talk to AWS.
+- ClusterSecretStore is `Ready` → the connection to Secrets Manager works.
+- ExternalSecret is `SecretSynced` → the password really arrived in the namespace.
+
+---
 
 ## Step 8 — Watch all apps come up
 
-Both `k8s/argocd/application.yaml` (the `bookstore` Application — the React frontend and its shared namespace resources: storage class, secrets bootstrap, network policy, PDB, quota) and `k8s/argocd/applicationset-microservices.yaml` (all 5 backend microservices: catalog, user, order, notification, api-gateway, one ArgoCD `Application` each) were already applied by Terraform in Step 4 — nothing to `kubectl apply` here. There is no backend monolith anymore; the original single frontend/backend pair was fully replaced by these 5 microservices, and `application.yaml` deploys frontend only.
-
-Just watch ArgoCD reconcile, within 3 minutes of the apply finishing:
+Terraform already applied `application.yaml` (the frontend and shared resources) and the ApplicationSet (the five services). **Nothing to `kubectl apply` here.** Just watch ArgoCD work. It reconciles within about 3 minutes.
 
 ```bash
 kubectl get applications -n argocd
@@ -211,29 +294,38 @@ kubectl get pods -n notification
 kubectl get pods -n gateway
 ```
 
-For catalog-service/user-service/order-service/notification-service, ArgoCD's sync also runs each service's own `<service>-schema-init` PreSync hook Job automatically (creates its schema, creates its own DB user) — no manual secret-copying, no manual Job apply. Each reads its own admin credentials from an `admin-db-secret` ExternalSecret, which pulls the same `/bookstore/db-credentials` entry the old monolith already uses, materialized into that service's namespace by ESO. `api-gateway` has no schema-init Job — it's stateless.
+**What happens during each sync:**
+- For catalog, user, order, and notification, ArgoCD first runs a **schema-init Job** (a PreSync hook). It creates the database, the tables, and that service's own DB user.
+- Each Job reads the admin login from an `admin-db-secret` ExternalSecret. That secret copies `/bookstore/db-credentials` into the service's namespace.
+- `api-gateway` has **no** schema-init Job, because it has no database.
 
-Watch any service's hook if you want to confirm it ran cleanly:
+**Watch a hook run (it only exists briefly):**
 
 ```bash
 kubectl get jobs -n catalog
-kubectl logs job/catalog-schema-init -n catalog   # only exists briefly — hook-delete-policy removes it after success
+kubectl logs job/catalog-schema-init -n catalog
 ```
 
-`api-gateway` has a real public `Ingress` for `api.bookstore.<domain>` — the old monolith's ingress no longer declares that host (the collision described in earlier revisions of this doc is resolved), so `api.bookstore.<domain>` reaching `api-gateway` is the live, working path, not something to route around:
+### Test the gateway
 
 ```bash
 curl -s https://api.bookstore.<domain>/health
 ```
 
-If you'd rather bypass DNS/ingress entirely (e.g. verifying straight after an apply, before DNS has propagated), `kubectl port-forward` still works the same as always:
+Right after apply, DNS might not be ready. Bypass it with port-forward:
 
 ```bash
 kubectl port-forward -n gateway svc/gateway-service 8082:80
 curl -s http://localhost:8082/health
 ```
 
-If images haven't been built/pushed by CI yet (first-ever deploy, before any CI run has landed), all 6 pods (`frontend` + the 5 microservices) will sit in `ImagePullBackOff` until real images exist in their ECR repos — **this is expected on a genuinely fresh account**, not a sign anything is broken. Either wait for a CI run to land on `main` (fastest — just push any commit), or push once by hand per service:
+### Pods stuck in `ImagePullBackOff`? Relax, it is expected
+
+On a **fresh account**, no images exist in ECR yet. So all six app pods (frontend + 5 services) wait in `ImagePullBackOff`. Nothing is broken.
+
+**Fix 1 (easiest):** push any commit to `main`. CI builds and pushes the images.
+
+**Fix 2 (by hand):**
 
 ```bash
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -245,7 +337,7 @@ docker build -t "$REGISTRY/bookstore-frontend:manual" client/
 docker push "$REGISTRY/bookstore-frontend:manual"
 (cd k8s/overlays/prod && kustomize edit set image bookstore-frontend="$REGISTRY/bookstore-frontend:manual")
 
-# Each of the 5 microservices follows the identical pattern -- swap the name:
+# Each service follows the same pattern — just swap the name:
 docker build -t "$REGISTRY/bookstore-catalog-service:manual" services/catalog-service/
 docker push "$REGISTRY/bookstore-catalog-service:manual"
 (cd k8s/services/catalog-service/overlays/prod && kustomize edit set image bookstore-catalog-service="$REGISTRY/bookstore-catalog-service:manual")
@@ -255,7 +347,9 @@ git add k8s/overlays/prod/kustomization.yaml k8s/services/*/overlays/prod/kustom
 git commit -m "chore: manual image push for first deploy" && git push
 ```
 
-Verify catalog-service directly (bypassing the gateway, useful for isolating whether a problem is in the service itself or in the gateway/ingress path):
+### Test one service directly (skip the gateway)
+
+This helps you find out: is the problem in the service, or in the gateway/ingress path?
 
 ```bash
 kubectl port-forward -n catalog svc/catalog-service 8081:80
@@ -265,17 +359,17 @@ curl -s http://localhost:8081/books
 curl -s http://localhost:8081/metrics | grep 'service="catalog-service"'
 ```
 
-### Verify the frontend end-to-end (real UI, not just curl)
+### Test the real website (UI)
 
-The React app at `bookstore.<domain>` has a real login/cart/checkout/order-history flow wired to `api-gateway` — worth clicking through after any deploy that touches `client/` or the gateway:
+Open the site and click through it:
 
-1. Open `https://bookstore.<domain>` — should show the book catalog (public, no login needed).
+1. Open `https://bookstore.<domain>`. You should see the book list. No login needed.
 2. Register a new account, then log in.
-3. Click "Add to Cart" on a book, go to Cart, adjust quantity, proceed to Checkout, place the order.
-4. Check Orders — the placed order should show with status `pending`.
-5. Log out, confirm `/cart`, `/checkout`, `/orders` all redirect to `/login` when visited directly while logged out.
+3. Click "Add to Cart", open Cart, change the quantity, go to Checkout, place the order.
+4. Open Orders. The new order should show status `pending`.
+5. Log out. Then visit `/cart`, `/checkout`, and `/orders` directly. Each should send you to `/login`.
 
-Equivalent via `curl` if you don't have browser access (e.g. testing from a box without a display):
+**No browser? Use curl instead:**
 
 ```bash
 curl -s https://api.bookstore.<domain>/auth/register -H "Content-Type: application/json" \
@@ -288,24 +382,45 @@ curl -s -X POST https://api.bookstore.<domain>/orders/checkout -H "Authorization
 curl -s https://api.bookstore.<domain>/orders -H "Authorization: Bearer $TOKEN"
 ```
 
-## Ongoing deploys (once the initial stand-up is done)
+**Fun fact:** the **first account you register becomes the admin**. So register your own account first, before sharing the site with anyone!
 
-You almost never run `kubectl apply` for app changes after this point — push to `main`, let CI build/scan/push the image, approve the `deploy` job's manual gate, and ArgoCD picks it up within 3 minutes. See [`ARCHITECTURE.md`](ARCHITECTURE.md) (GitOps / deployment flow section).
+---
+
+## Ongoing deploys
+
+After the first stand-up, you almost never run `kubectl apply` for app changes.
+
+1. Push your change to `main`.
+2. CI tests it, builds the image, scans it, and pushes it.
+3. A reviewer approves the `deploy` job.
+4. CI updates the image tags in Git.
+5. ArgoCD deploys within about 3 minutes.
+
+See the GitOps section in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+---
 
 ## Monitoring access
 
 ```bash
 cd terraform
 terraform output grafana_url        # Grafana, default user "admin"
-terraform output prometheus_url     # Prometheus, also user "admin"
-terraform output alertmanager_url   # Alertmanager, also user "admin"
+terraform output prometheus_url     # Prometheus, user "admin"
+terraform output alertmanager_url   # Alertmanager, user "admin"
 aws secretsmanager get-secret-value --secret-id /bookstore/grafana-admin --query SecretString --output text
 aws secretsmanager get-secret-value --secret-id /bookstore/monitoring-basic-auth --query SecretString --output text
 ```
 
-> **On Windows**, run `python3 scripts/monitoring_credentials.py` instead of the block above — Git Bash silently mangles any argument starting with `/` (like `--secret-id /bookstore/grafana-admin`) into a Windows path before it reaches `aws.exe`, which fails with a confusing "Invalid name" error. The script prints every URL + password in one table, sidestepping that entirely.
+> **On Windows,** run `python3 scripts/monitoring_credentials.py` instead. Git Bash changes any argument starting with `/` (like `/bookstore/grafana-admin`) into a Windows path. Then `aws.exe` fails with a confusing "Invalid name" error. The script prints every URL and password in one table and avoids the problem.
 
-`Makefile` has `make monitoring-status` (Docker Compose status on the box) and `make monitoring-logs` (tails the init/dashboard-import logs) — both auto-fetch an auto-generated SSH key from Terraform state via a `monitoring-key` prerequisite target (saved locally as `.monitoring-ssh-key.pem`, gitignored), no manual key management needed.
+**Handy Makefile commands:**
+- `make monitoring-status` — shows Docker Compose status on the monitoring box.
+- `make monitoring-logs` — follows the setup logs.
+- Both fetch an SSH key from Terraform state automatically (saved as `.monitoring-ssh-key.pem`, gitignored).
+
+**Want to see an alert fire?** Run `python3 scripts/simulate_load.py`. It creates CPU and traffic load. The demo alerts (`HighPodCPUUsage`, `HighRequestRate`) fire in about 2 minutes, and the email arrives soon after. Use `--duration 240` for a comfortable margin. It cleans up after itself.
+
+---
 
 ## Tearing it down
 
@@ -314,21 +429,44 @@ cd terraform
 terraform destroy
 ```
 
-`module.route53.aws_route53_zone.public` no longer carries a `prevent_destroy` lifecycle block — `terraform destroy` tears down the public zone along with everything else, no refusal.
+`make destroy` does the same with `-auto-approve`. Use the plain command if you want a confirmation prompt.
 
-> **Real consequence:** the next `apply` creates a **brand-new zone with brand-new, randomly-assigned nameserver values**, and your domain registrar needs to be re-pointed at them again before ACM certificate validation (and anything depending on it, like the ALB's TLS listener) can complete. Grab `terraform output route53_public_name_servers` and update the registrar as early in the apply as possible, not after it finishes — DNS propagation can take anywhere from minutes to hours, and doing it early lets that time overlap with RDS/EKS provisioning (~20-30 min) instead of adding to the total.
+**What is built in to make destroy safe** (because this stack is created and deleted often):
+- The ALB and Ingress are released **before** the VPC is torn down.
+- A helper script removes hidden EKS network leftovers.
+- Secrets Manager entries use `recovery_window_in_days = 0`, so they delete right away and the names are free again.
+- ArgoCD apps carry a finalizer, so ArgoCD deletes everything it manages **before** the app itself goes away. Terraform handles the order for you.
 
-This project's Terraform has real destroy-safety automation baked in specifically because this stack gets destroyed and recreated often during development:
+**Good news about DNS:**
+- The public Route 53 zone is only **looked up** by Terraform (a `data` source). It is never created or destroyed by it.
+- So `terraform destroy` leaves the zone alone. Your **four NS values stay the same**.
+- You do **not** need to touch your registrar again after a destroy and re-apply. That is why Step 3 is "once per domain, ever".
+- Only the alias records Terraform created (pointing at the ALB) are removed.
+- You can print the nameservers any time with `terraform output route53_public_name_servers`.
 
-- Ingress/ALB release before VPC teardown
-- `recovery_window_in_days = 0` on Secrets Manager entries
+**Easy memory trick:** Terraform borrows the zone. It never owns it, so it never throws it away.
 
-`make destroy` runs it with `-auto-approve`; use the plain command if you want the interactive confirmation.
+---
 
-Since `argocd.tf`'s `kubectl_manifest` resources are now what created the ArgoCD `Application`/`ApplicationSet` objects, `terraform destroy` also deletes them — and both carry `resources-finalizer.argocd.argoproj.io`, so ArgoCD deletes everything it manages (all of `k8s/overlays/prod` and every `k8s/services/*/overlays/prod`) before the `Application` object itself actually goes away. This happens automatically, in the right order, before `eks-addons`/`eks` get torn down (Terraform destroys in reverse-dependency order).
+## Troubleshooting cheat sheet
+
+| Symptom | Likely reason | What to do |
+|---|---|---|
+| `terraform plan` wants to create everything | State backend not configured | Run `init_backend.py` (Step 2) |
+| ACM validation hangs | Registrar NS not set or not spread yet | Re-check Step 3 and wait |
+| CI fails at AWS login | No `AWS_ROLE_ARN` secret | Step 5 |
+| CI fails at SonarCloud | No `SONAR_TOKEN` secret | Step 5 |
+| `AlreadyExistsException` | Old entries from lost state | `make import` (Step 6) |
+| Pods in `ImagePullBackOff` | No images in ECR yet | Push to `main` or push by hand (Step 8) |
+| ExternalSecret not `SecretSynced` | ESO role or store not ready | Step 7 checks |
+| ALB targets unhealthy | Health check path wrong | Gateway ingress needs `healthcheck-path: /health` |
+| `Invalid name` on Windows | Git Bash path mangling | Use `monitoring_credentials.py` |
+| Destroy fails with `DependencyViolation` | Leftover EKS network resources | The cleanup helper normally prevents it; re-run destroy |
+
+---
 
 ## Related
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — system-level view: module graph, region layout, secrets flow, GitOps deployment flow
-- [`UML.md`](UML.md) — application-layer UML: component/class/ER/sequence diagrams
-- [`README.md`](../README.md) — tech stack, repo structure, local development, CI/CD overview
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — how everything fits together and why
+- [`UML.md`](UML.md) — diagrams of the app: login, checkout, data model
+- [`../README.md`](../README.md) — tech stack, repo structure, local development

@@ -1,146 +1,294 @@
-# k8s folder, explained — file by file, service by service
+# k8s Folder, Explained — File by File, Service by Service
 
-Personal reference doc, not part of the repo's real documentation (that's `docs/ARCHITECTURE.md`, `docs/DEPLOYMENT.md`, `docs/UML.md`). Gitignored — a local snapshot, not a maintained doc. Companion to [[terraform-explained.md]]. Covers `main`'s single-cluster state, written 2026-08-27. The `dr` branch carries its own extended copy with a "Part 5" for the `k8s/argocd/dr/` + `overlays/dr/` standby trees — not here. If the manifests change further, this can go stale.
+Friends, this is a **reading guide** for the `k8s/` folder. Open the real YAML file next to this page and follow along.
 
-Everything lives under `k8s/`. Two independent kustomize trees: `k8s/base/` + `k8s/overlays/` (the **frontend**, deployed by a single hand-written ArgoCD `Application`) and `k8s/services/<name>/` × 5 (the **backend microservices**, deployed by one ArgoCD `ApplicationSet`). `k8s/argocd/` holds the GitOps wiring that ties both trees to the cluster. No Helm anywhere in this folder — every workload is plain kustomize. (The `dr` branch adds a third set of trees under `*/overlays/dr/` for the standby cluster — see that branch's copy of this doc.)
+**Good to know:**
+- This is a personal reference note, not the main documentation. The main docs are `docs/ARCHITECTURE.md`, `docs/DEPLOYMENT.md`, and `docs/UML.md`.
+- It describes `main` with a single cluster. If the manifests change, this page can go out of date.
+- Companion guide: [`terraform-explained.md`](terraform-explained.md).
+
+**How the folder is organized:**
+- Everything is under `k8s/`.
+- There are **two separate kustomize trees**:
+  - `k8s/base/` + `k8s/overlays/` = the **frontend**. Deployed by one ArgoCD `Application`.
+  - `k8s/services/<name>/` × 5 = the **backend microservices**. Deployed by one ArgoCD `ApplicationSet`.
+- `k8s/argocd/` = the GitOps wiring that connects both trees to the cluster.
+- **No Helm** in this folder. Everything is plain kustomize.
+
+**Easy memory trick:** base = the recipe. overlay = the small change for this kitchen (prod). ArgoCD = the cook who follows it.
 
 ---
 
 ## Part 1 — Frontend tree (`k8s/base/`, `k8s/overlays/`)
- 
+
 ### `base/kustomization.yaml`
-The frontend's kustomize base. Sets `namespace: bookstore` for every resource listed (so none of the individual files below need their own `namespace:` field except `namespace.yaml` itself, which defines that namespace). A comment here records why `k8s/base/monitoring/` (`servicemonitor.yaml` + `prometheus-rules.yaml`) is gone: both were `monitoring.coreos.com/v1` CRDs needing the Prometheus Operator, which this cluster doesn't run (Prometheus is on the standalone `monitoring-ec2`, see `docs/ARCHITECTURE.md`), and an unknown CRD type doesn't just get skipped — it fails the *entire* ArgoCD sync batch (`ComparisonError`/`SyncFailed`, `TROUBLESHOOTING.md` OBS-012). They were never in the resources list and were deleted outright on 2026-08-29; the comment says don't re-add them.
+- The frontend's kustomize base.
+- Sets `namespace: bookstore` for everything listed. So the other files need no `namespace:` line (except `namespace.yaml`, which creates it).
+- A comment explains why there is **no** `monitoring/` folder:
+  - `ServiceMonitor` and `PrometheusRule` need the Prometheus Operator. This cluster does not run it.
+  - An unknown resource type fails the **whole** ArgoCD sync, not just that one file.
+  - They were deleted on 2026-08-29. Please do not add them back.
 
 ### `base/namespace.yaml`
-Creates the `bookstore` namespace with Pod Security Standards labels (`enforce`/`audit`/`warn: restricted`) — the strictest PSS tier, blocking any pod that runs as root, escalates privileges, or skips a seccomp profile at admission time, before it ever reaches a kubelet.
+- Creates the `bookstore` namespace.
+- Adds Pod Security Standards labels (`enforce`, `audit`, `warn` = `restricted`). This is the strictest level.
+- It blocks root pods, privilege escalation, and missing seccomp profiles **at admission**, before the pod ever starts.
 
 ### `base/frontend/deployment.yaml`
-The only workload in this tree. 2 replicas, `nginx`-based static SPA. `automountServiceAccountToken: false` (no K8s API calls from this pod, ever). `runAsUser: 101` — nginx's own unprivileged UID inside the `nginxinc` image, not an arbitrary choice. `readOnlyRootFilesystem: true` forces three `emptyDir` mounts (`/tmp`, `/var/cache/nginx`, `/var/run`) since nginx needs to write there at runtime even with no other persistent state.
+- The only workload here: 2 replicas, nginx serving the React build.
+- `automountServiceAccountToken: false` — this pod never calls the Kubernetes API.
+- `runAsUser: 101` — nginx's own unprivileged user. Not a random number.
+- `readOnlyRootFilesystem: true` forces three `emptyDir` mounts (`/tmp`, `/var/cache/nginx`, `/var/run`), because nginx must write there.
 
 ### `base/frontend/service.yaml`
-`ClusterIP` on port 80 → container port 8080. Only consumer is the shared ALB via `base/ingress/ingress.yaml`.
+- `ClusterIP`, port 80 → container port 8080.
+- Its only customer is the shared ALB.
 
 ### `base/ingress/ingress.yaml`
-One `Ingress` object, `ingressClassName: alb` (AWS Load Balancer Controller, not the retired `ingress-nginx`). `alb.ingress.kubernetes.io/group.name: bookstore` is the load-bearing line — the api-gateway's own Ingress (`k8s/services/api-gateway/base/ingress.yaml`) carries the *same* group name, so the controller provisions **one** ALB shared by both host rules instead of two separate ALBs. No `certificate-arn` annotation — the controller auto-discovers a matching ACM cert by host (see `terraform/ingress-cert.tf`). Host is a placeholder (`bookstore.YOUR_DOMAIN_HERE.com`) stamped by `scripts/configure.py`, never hand-edited.
+- One Ingress with `ingressClassName: alb` (AWS Load Balancer Controller, not the retired `ingress-nginx`).
+- **The key line:** `alb.ingress.kubernetes.io/group.name: bookstore`.
+  - The api-gateway Ingress uses the **same** group name.
+  - So the controller builds **one ALB** for both, not two.
+- No `certificate-arn` annotation. The controller finds a matching ACM cert by host name (see `terraform/ingress-cert.tf`).
+- The host is a placeholder that `scripts/configure.py` replaces. Never hand-edit it.
 
 ### `base/network-policy/network-policy.yaml`
-Two policies. `default-deny-all`: empty `podSelector` + both `Ingress`/`Egress` policy types = default-deny for the whole `bookstore` namespace, the baseline every other rule here punches a hole through. `frontend-policy`: ingress allowed only from `170.20.0.0/16` (the VPC CIDR) on port 8080 — an `ipBlock`, not a `namespaceSelector`, because the ALB (`target-type: ip`) connects straight to the pod's real ENI IP from its own ENIs in the VPC, never routing through some `ingress-nginx` namespace's pods the way the old controller did. Egress allowed only to DNS (53/UDP+TCP) — the SPA's actual API calls happen client-side, from the user's browser straight to `api-gateway` over the internet, not from this pod server-side, so no `api-gateway` egress rule exists here at all.
+- **Two policies:**
+  - `default-deny-all` — an empty `podSelector` with both policy types. It blocks everything in the namespace. Every other rule makes a small hole in it.
+  - `frontend-policy` — allows ingress only from `170.20.0.0/16` on port 8080.
+- It uses `ipBlock`, **not** `namespaceSelector`. The ALB (`target-type: ip`) connects straight to the pod's IP from its own network interfaces in the VPC. It is not a pod in some namespace.
+- Egress allows only DNS (53). The browser calls the API directly from the user's device, not from this pod. So no gateway egress rule is needed.
 
 ### `base/pdb/pdb.yaml`
-`frontend-pdb`: `minAvailable: 1` against 2 replicas — safe here specifically because replicas > 1 means Kubernetes can still evict one pod for a node drain/upgrade without violating the budget. (Contrast with the backend services below, which run `replicas: 1` and use `maxUnavailable` instead — see Part 2.)
+- `minAvailable: 1` with 2 replicas.
+- This is safe because Kubernetes can still evict one pod during a node drain or upgrade.
+- Compare with the backend services in Part 2.
 
-### `base/limitrange.yaml` / `base/quota.yaml`
-`LimitRange`: default request/limit (50m/64Mi request, 250m/128Mi limit) applied to any *future* container added without its own explicit values — every container already in this tree sets its own, so this is a backstop, not an active constraint. `ResourceQuota`: namespace-wide ceiling (2 CPU / 2Gi requests, 4 CPU / 4Gi limits, 20 pods) — sized for the frontend's own footprint, unrelated to the per-service quotas backend namespaces don't have (see Part 2).
+### `base/limitrange.yaml` and `base/quota.yaml`
+- **LimitRange:** default values (50m/64Mi request, 250m/128Mi limit) for any future container that forgets to set its own. A backstop, not an active limit.
+- **ResourceQuota:** namespace ceiling of 2 CPU / 2Gi requests, 4 CPU / 4Gi limits, 20 pods. Sized for the frontend only.
 
 ### `base/storageclass/gp3.yaml`
-Cluster-scoped `StorageClass`, `is-default-class: true`, `reclaimPolicy: Retain` (a deleted PVC doesn't delete the underlying EBS volume — deliberate, though nothing in this repo currently provisions a PVC against it). Listed in `k8s/argocd/appproject.yaml`'s `clusterResourceWhitelist` since it's cluster-scoped, same reasoning as `Namespace` and `ClusterSecretStore`.
+- A cluster-wide `StorageClass`, the default one, with `reclaimPolicy: Retain`. A deleted PVC does **not** delete the EBS volume.
+- Nothing in this repo claims it right now.
+- It is on the AppProject's `clusterResourceWhitelist`, because it is cluster-scoped.
 
 ### `base/secrets/external-secret.yaml`
-Defines the `ClusterSecretStore` (`aws-secretsmanager`) — the one piece every namespace's `ExternalSecret` points at via `secretStoreRef`. `argocd.argoproj.io/hook: PreSync`, `sync-wave: "-2"` — must exist before *any* `ExternalSecret`'s own PreSync hook runs (this file's wave is one earlier than every service's `sync-wave: "-1"`, see Part 2). Without the hook annotation this would be a plain Sync-phase resource, and ArgoCD always applies Sync-phase resources *after* every PreSync hook — on a from-scratch cluster that guarantees every `ExternalSecret`'s first reconcile fails with "could not get ClusterSecretStore … not found", not as a race, every single time. See `TROUBLESHOOTING.md` OBS-030. The old backend monolith's own `db-secret` `ExternalSecret` used to live in this file too — deleted with the monolith; the `ClusterSecretStore` itself stayed, since every microservice's own `ExternalSecret` still references it by name.
-
-### `base/monitoring/` — removed
-`servicemonitor.yaml` + `prometheus-rules.yaml` were deleted 2026-08-29 (commit `cdbd5cc`). They were never wired into `base/kustomization.yaml` (no Prometheus Operator to consume them), and an older revision of `prometheus-rules.yaml` still referenced the deleted backend monolith. `docs/ARCHITECTURE.md` and the `base/kustomization.yaml` comment both note not to reintroduce them — an unknown CRD type fails the whole ArgoCD sync batch.
+- Defines the **`ClusterSecretStore`** `aws-secretsmanager`. Every service's `ExternalSecret` points to it.
+- Annotations: `PreSync` hook, `sync-wave: "-2"`.
+- **Why the hook matters:**
+  - Without it, this would be a normal Sync resource.
+  - ArgoCD always applies Sync resources **after** every PreSync hook.
+  - So on a fresh cluster every ExternalSecret would fail with "ClusterSecretStore not found". Every time, not by chance.
+- The old backend's `db-secret` was removed with the monolith. The store stayed.
 
 ### `overlays/dev/kustomization.yaml`
-References `../../base`, patches `Deployment/frontend` replicas from 2 → 1 via a JSON patch. Not wired into any ArgoCD `Application` currently — `k8s/argocd/application.yaml` points at `overlays/prod`. Exists for a local `kustomize build k8s/overlays/dev` / manual `kubectl apply -k` workflow only.
+- Uses `../../base` and lowers the frontend replicas from 2 to 1.
+- **Not used by ArgoCD.** It is only for local `kustomize build` or `kubectl apply -k`.
 
 ### `overlays/prod/kustomization.yaml` + `hpa-frontend.yaml`
-The tree ArgoCD actually deploys (`k8s/argocd/application.yaml`'s `path`). Adds `hpa-frontend.yaml` (`minReplicas: 1`, `maxReplicas: 3`, 70% CPU target) on top of the base. `images:` block rewrites `bookstore-frontend:latest` → the real ECR URI + SHA tag — CI's deploy stage runs `kustomize edit set image` here on every push (`${ECR_REGISTRY}/bookstore-frontend:${SHA}`); the `000000000000` account-ID placeholder in the committed file is intentional, never hand-edited.
+- This is what ArgoCD actually deploys.
+- Adds an HPA: 1 to 3 replicas, 70% CPU target.
+- The `images:` block rewrites `bookstore-frontend:latest` to the real ECR image and tag.
+- CI runs `kustomize edit set image` here on every deploy. That is where the "chore: bump image tags" commits come from.
+
+**Easy memory trick:** the base says what the app is. The prod overlay says which image and how many copies.
 
 ---
 
 ## Part 2 — Backend microservices (`k8s/services/<name>/`)
 
-Five services, near-identical structure: `catalog-service`, `user-service`, `order-service`, `notification-service`, `api-gateway`. Each owns its **own namespace** (`catalog`, `user`, `order`, `notification`, `gateway`) — full blast-radius isolation, not just a logical grouping within one namespace like the frontend tree. `catalog-service` is used as the reference below since it's the most complete (has the schema-init Job the others share the same pattern for); differences per service are called out at the end of this Part.
+**The five services:** `catalog-service`, `user-service`, `order-service`, `notification-service`, `api-gateway`.
+
+- Almost the same layout each time.
+- Each has its **own namespace**: `catalog`, `user`, `order`, `notification`, `gateway`. This gives real isolation, not just a label.
+- `catalog-service` is used as the example below. Differences are listed at the end.
 
 ### `base/kustomization.yaml`
-Sets `namespace: <service-namespace>`. Resource list order matters for readability but *not* for apply order — ArgoCD's own sync-wave/hook annotations control that (see below), kustomize just concatenates.
+- Sets `namespace: <service-namespace>`.
+- The order of the resource list does not control apply order. ArgoCD's sync waves and hooks do.
 
 ### `base/namespace.yaml`
-Same PSS-`restricted` pattern as the frontend's. One per service — 5 separate namespace objects, all in the `clusterResourceWhitelist`'s `Namespace` entry (a single whitelist rule covers all of them, since AppProject rules match by `kind`, not by name).
+- Same `restricted` Pod Security pattern as the frontend.
+- One `Namespace` entry in the AppProject whitelist covers all of them, because the whitelist matches by kind.
 
 ### `base/configmap.yaml`
-Non-secret config only: `DB_PORT`, `DB_NAME`, `APP_PORT`, and for `api-gateway` specifically, the other services' internal DNS names (`http://catalog-service.catalog.svc.cluster.local`, etc.) plus `FRONTEND_URL` for its CORS allow-list — the only origin the gateway will accept browser requests from, stamped by `scripts/configure.py` the same way the Ingress hosts are.
+- Non-secret settings only: `DB_PORT`, `DB_NAME`, `APP_PORT`.
+- For `api-gateway` it also holds the other services' internal DNS names and `FRONTEND_URL` (its CORS allow-list, stamped by `configure.py`).
 
 ### `base/external-secret.yaml`
-Per-service `ExternalSecret` (e.g. `catalog-db-secret`), pulling from a per-service Secrets Manager path (`/bookstore/catalog-db-credentials`) — `DB_USERNAME`/`DB_PASSWORD`/`DB_HOST`. `PreSync`, `sync-wave: "-1"` — one wave *after* the `ClusterSecretStore`'s `-2` (must exist first) and at the *same* wave as `admin-db-secret.yaml` and *before* `schema-init-job.yaml`'s implicit wave `0`. Getting this ordering wrong was a real incident: without it, the schema-init Job failed with `CreateContainerConfigError: secret … not found`, retried for 15 minutes, never self-resolved — see `TROUBLESHOOTING.md` OBS-013. `refreshInterval: 1h` — ESO polls Secrets Manager hourly and rotates the K8s Secret automatically on change, no redeploy needed.
+- A per-service `ExternalSecret` such as `catalog-db-secret`.
+- Reads `/bookstore/catalog-db-credentials` (`DB_USERNAME`, `DB_PASSWORD`, `DB_HOST`).
+- `PreSync`, `sync-wave: "-1"`. This is **after** the store (`-2`) and **before** the schema-init Job (`0`).
+- **Real incident:** with the wrong wave, the Job failed with `CreateContainerConfigError: secret not found` and retried for 15 minutes.
+- `refreshInterval: 1h` — ESO checks Secrets Manager hourly and updates the Kubernetes Secret itself. No redeploy needed.
 
 ### `base/admin-db-secret.yaml`
-Pulls the *shared RDS admin* credentials (`/bookstore/db-credentials` — same secret `terraform/main.tf` creates once) a second time, into this service's own namespace, so `schema-init-job.yaml` can create its schema/user without a manual cross-namespace `kubectl get secret | kubectl apply` step. No new IAM permissions needed — the `ClusterSecretStore`'s IRSA role is already scoped to all of `/bookstore/*`. Same `PreSync`/`-1` wave as `external-secret.yaml`, same reasoning.
+- Copies the shared RDS **admin** login (`/bookstore/db-credentials`) into this service's namespace.
+- The schema-init Job needs it to create the database and user.
+- No new IAM permission is needed. The store's role already covers `/bookstore/*`.
+- Same `PreSync` / `-1` wave.
 
 ### `base/schema-init-job.yaml`
-An ArgoCD `PreSync` hook `Job` (default wave `0`, i.e. after both `-1`-wave secrets). Hooks are exempt from ArgoCD's normal selfHeal/prune diffing — necessary because Jobs are *immutable* once created; a plain (non-hook) Job here would make every subsequent sync error trying to re-apply an unchanged-but-immutable spec. `hook-delete-policy: BeforeHookCreation,HookSucceeded` — not just `HookSucceeded`: a Job that *fails* is never cleaned up by `HookSucceeded` alone (it only fires on success), so every following sync would just keep waiting on the same permanently-broken Job forever instead of retrying. `BeforeHookCreation` deletes the previous hook resource — success or failure — before creating the next one, matching the SQL's own idempotent design (`CREATE ... IF NOT EXISTS`, `INSERT ... ON DUPLICATE KEY UPDATE`, guarded seed-count check) — see `TROUBLESHOOTING.md` OBS-015.
+- An ArgoCD **PreSync hook** Job.
+- **Why a hook?** Jobs cannot be changed after they are created. A normal Job would make every later sync fail. Hooks are exempt.
+- `hook-delete-policy: BeforeHookCreation,HookSucceeded`
+  - `HookSucceeded` alone never cleans up a **failed** Job. Every sync would then wait on the same broken Job forever.
+  - `BeforeHookCreation` removes the old one first, whatever happened.
+- The SQL is **idempotent**: `CREATE ... IF NOT EXISTS`, `INSERT ... ON DUPLICATE KEY UPDATE`, and a guarded seed.
 
-Two sharp edges baked into the inline SQL, both from real incidents:
-- The heredoc is unquoted (`<<SQL`, not `<<'SQL'`) so `$CATALOG_DB_PASSWORD` expands — but an unquoted heredoc *also* treats bare backticks as shell command substitution. An earlier version had literal `` `desc` `` (a MySQL reserved-word column name needing backtick-quoting) run as the shell command `desc` three times instead of staying literal text — silently stripping the identifier from every statement that used it. Fixed by escaping every backtick as `` \` `` (a literal backtick to the shell; MySQL still sees a quoted identifier). See `TROUBLESHOOTING.md` OBS-003 / OBS-017.
-- The seed-insert is guarded on `SELECT COUNT(*) FROM catalog_db.books = 0`, not on "these two specific titles are missing" — because this Job runs on *every* sync (idempotent-by-design, not one-time), and an admin who deliberately deletes a default book should see it stay deleted, not get silently re-inserted on the next ArgoCD sync.
+**Two sharp edges, both from real bugs:**
+- The shell heredoc is unquoted (`<<SQL`) so `$CATALOG_DB_PASSWORD` expands. But an unquoted heredoc also treats backticks as shell commands. The column name `` `desc` `` (a reserved word) was run as a shell command and vanished from the SQL. The fix: escape every backtick as `` \` ``.
+- The seed insert runs only if `SELECT COUNT(*) FROM catalog_db.books = 0`. The Job runs on **every** sync. If an admin deletes a default book on purpose, it must stay deleted.
 
-`Job`'s pod template carries `labels: app: catalog-service` — without this exact label the namespace's `default-deny-all` NetworkPolicy blocks its egress to RDS outright, since it wouldn't match `catalog-service-policy`'s `podSelector`.
+**Label gotcha:** the Job's pod carries `app: catalog-service`. Without that exact label, the namespace's `default-deny-all` policy blocks its way to RDS.
 
 ### `base/deployment.yaml`
-`replicas: 1` (not 2+ like the frontend — see the PDB note below). `prometheus.io/scrape`/`port`/`path` annotations — the mechanism Prometheus on `monitoring-ec2` actually uses to discover this pod (via the EKS API server's pod-proxy, since pod IPs aren't reachable from outside the cluster network — see [[terraform-explained.md]]'s `monitoring-ec2` section). `runAsUser: 1001` (Node.js images' conventional non-root UID, distinct from the frontend's nginx-specific `101`). Env vars split cleanly: `DB_HOST`/`DB_USERNAME`/`DB_PASSWORD` from the `ExternalSecret`-backed Secret, `DB_PORT`/`DB_NAME`/`APP_PORT` from the plain `ConfigMap` — secrets and config never mixed in the same source. `readinessProbe`/`livenessProbe` both hit `/health` on 3000, with `livenessProbe`'s longer `initialDelaySeconds: 30` giving the app strictly more time before Kubernetes considers restarting it outright, vs. readiness's 10s just gating traffic.
+- `replicas: 1`.
+- `prometheus.io/scrape`, `port`, and `path` annotations. This is how Prometheus on the monitoring EC2 finds the pod (through the API server's pod proxy, since pod IPs are not reachable from outside).
+- `runAsUser: 1001` — the usual non-root user for Node images. Different from the frontend's `101`.
+- **Secrets and config are kept apart:**
+  - `DB_HOST`, `DB_USERNAME`, `DB_PASSWORD` come from the ExternalSecret's Secret.
+  - `DB_PORT`, `DB_NAME`, `APP_PORT` come from the ConfigMap.
+- **Probes:**
+  - Readiness: `/health` on 3000, wait 10s. It only controls traffic.
+  - Liveness: `/health` on 3000, wait 30s. A longer wait, because a failed liveness check **restarts** the pod.
 
 ### `base/service.yaml`
-`ClusterIP`, port 80 → container port 3000. Internal-only — no service in this tree is ever `LoadBalancer` or `NodePort`; the only path in from outside the cluster is the shared ALB via `api-gateway`'s own `Ingress`.
+- `ClusterIP`, port 80 → container port 3000.
+- Internal only. No service here is `LoadBalancer` or `NodePort`. The only way in from outside is the ALB through the gateway.
 
 ### `base/hpa.yaml`
-`catalog-service`: `minReplicas: 1`, `maxReplicas: 5`, both CPU (70%) *and* memory (80%) triggers — the only backend service with a memory trigger, reflecting that catalog reads/serves larger payloads (book cover URLs, descriptions) than the others. The rest scale on CPU only.
+- `catalog-service`: 1 to 5 replicas, scales on CPU (70%) **and** memory (80%).
+- Every backend service's HPA has both a CPU and a memory trigger.
+- Older notes said only catalog had a memory trigger. That is no longer true, so check the file before you trust any note.
 
 ### `base/network-policy.yaml`
-Same `default-deny-all` + one scoped allow policy pattern as the frontend, but pod-to-pod traffic uses `namespaceSelector` (matching `kubernetes.io/metadata.name`), not `ipBlock` — unlike the ALB-to-pod hop, this traffic genuinely originates from another pod's real address inside the cluster, so `namespaceSelector` is the correct match here (vs. `ipBlock` for the ALB, see frontend section and `api-gateway`'s own comment on this same distinction). Egress to RDS uses the VPC CIDR block (`170.20.0.0/16`) as an `ipBlock` — RDS isn't a pod, so `namespaceSelector` isn't an option there regardless. `api-gateway-policy` specifically calls out one more sharp edge: egress rules matching ports must use **3000** (the pod's real `containerPort`), not **80** (the `Service`'s port) — NetworkPolicy egress matches the actual destination pod port *after* `kube-proxy`'s Service DNAT, not the Service's advertised port. An earlier version used 80 here, which would have silently blocked all `api-gateway → microservice` traffic the moment a NetworkPolicy-enforcing CNI was turned on. See `TROUBLESHOOTING.md` OBS-049.
+- Same pattern: `default-deny-all` plus one scoped allow policy.
+- **Pod-to-pod uses `namespaceSelector`** (matching `kubernetes.io/metadata.name`). This traffic really comes from another pod.
+- **RDS uses `ipBlock` `170.20.0.0/16`.** RDS is not a pod, so it cannot be selected.
+- **Port gotcha (in `api-gateway`'s policy):**
+  - Egress must use **3000** (the pod's real port), not **80** (the Service port).
+  - NetworkPolicy matches the real destination **after** kube-proxy's DNAT.
+  - An older version used 80. It would have silently blocked all gateway → service traffic once enforcement was on.
 
 ### `base/pdb.yaml`
-`maxUnavailable: 1`, **not** `minAvailable: 1` — deliberate, and the opposite of the frontend's PDB. These services run `replicas: 1` with no overlay bumping it; `minAvailable: 1` equal to the *total* replica count would mean Kubernetes could never permit a voluntary eviction of the only pod at all — `kubectl drain`, an EKS managed-node-group upgrade, or Cluster Autoscaler consolidation on that node would hang indefinitely waiting on a budget that can never be satisfied. `maxUnavailable: 1` still creates a real PDB object (blocks *simultaneous* multi-pod disruption where relevant) without blocking routine single-node maintenance on a single-replica service. See `TROUBLESHOOTING.md` OBS-049 (same incident ID as the NetworkPolicy port sharp edge above — one troubleshooting session, two related fixes).
+- `maxUnavailable: 1`, **not** `minAvailable: 1`.
+- With one replica, `minAvailable: 1` means "never evict the only pod". A node drain or upgrade would then **hang forever**.
+- `maxUnavailable: 1` is still a real PDB, but it allows normal maintenance.
+- This is the **opposite** of the frontend's PDB, on purpose.
 
 ### `base/limitrange.yaml`
-Identical values to the frontend's (50m/64Mi request, 250m/128Mi limit default) — same backstop-not-active-constraint reasoning, just duplicated per namespace since kustomize bases don't share cluster-scoped-adjacent resources across trees.
+- Same values as the frontend (50m/64Mi request, 250m/128Mi limit).
+- Copied per namespace, because namespaces do not share these.
 
 ### `overlays/prod/kustomization.yaml`
-Same `images:` rewrite pattern as the frontend overlay — CI's `kustomize edit set image bookstore-<service>=${ECR_REGISTRY}/bookstore-<service>:${SHA}` on every push, `000000000000` placeholder for manual local deploys.
+- Same `images:` pattern as the frontend. CI runs `kustomize edit set image bookstore-<service>=...:<SHA>` on every deploy.
 
-### Per-service differences from `catalog-service`
-- **`user-service`** — deployment adds a `JWT_SECRET` env var (the same shared HS256 secret `api-gateway` verifies against; `user-service` is the only one that *signs* tokens). No `schema-init-job.yaml` peer difference — same pattern, own schema.
-- **`order-service`** — deployment adds `NOTIFICATION_SERVICE_URL` (config, not secret) since placing an order triggers a notification. NetworkPolicy egress includes an extra `namespaceSelector` rule to the `notification` namespace on top of the RDS/DNS rules every service has.
-- **`notification-service`** — NetworkPolicy ingress is scoped to the `order` namespace only (not `gateway` like the other three) — nothing calls notification-service directly from the gateway; it's purely an internal callee of `order-service`.
-- **`api-gateway`** — the odd one out structurally: no `schema-init-job.yaml`/`admin-db-secret.yaml` at all (it owns no database), but it does own its own `ingress.yaml` (see below) and a distinct `external-secret.yaml` pulling `JWT_SECRET` instead of DB credentials. `replicas: 2` (the only backend service not at 1 — it's the single point every external request passes through, so it doesn't get the "single-replica is fine" treatment the DB-backed services get). Larger resource requests/limits (100m/128Mi request, 500m/256Mi limit vs. 50m/64Mi and 250m/128Mi elsewhere) to match.
+### What is different per service
+- **`user-service`** — adds a `JWT_SECRET` env var. It is the only one that **signs** tokens.
+- **`order-service`** — adds `NOTIFICATION_SERVICE_URL`. Its NetworkPolicy also allows egress to the `notification` namespace.
+- **`notification-service`** — ingress comes only from the `order` namespace, not from `gateway`. Only `order-service` calls it.
+- **`api-gateway`**
+  - No `schema-init-job.yaml` and no `admin-db-secret.yaml`, because it has no database.
+  - It has its own `ingress.yaml`.
+  - Its ExternalSecret pulls `JWT_SECRET` instead of DB credentials.
+  - `replicas: 2`, because every external request goes through it.
+  - Bigger resources: 100m/128Mi request, 500m/256Mi limit.
+  - It has a `pdb.yaml` with `minAvailable: 1`. That is safe because it runs 2 replicas.
 
 ### `api-gateway/base/ingress.yaml`
-The other half of the shared-ALB pair with `k8s/base/ingress/ingress.yaml` (same `group.name: bookstore`). One extra annotation the frontend's Ingress doesn't need: `alb.ingress.kubernetes.io/healthcheck-path: /health` — without it the ALB target-group health check defaults to path `/`, which `api-gateway`'s `app.js` never implements (only `/health`). Every target would sit permanently unhealthy (404 on every check) and the ALB would never route real traffic to it, even with the pods themselves fully `Running`/`Ready` per Kubernetes — a gap invisible from `kubectl get pods` alone.
+- The other half of the shared-ALB pair.
+- Extra annotation: `alb.ingress.kubernetes.io/healthcheck-path: /health`.
+- **Why:** the ALB's default health check path is `/`. The gateway has no `/` route (only `/health`). Every target would show 404, stay unhealthy, and get no traffic, even though `kubectl get pods` says `Running` and `Ready`.
+
+**Real-time example:** Pods green, website down. Check the ALB target group health before blaming the app.
 
 ---
 
 ## Part 3 — ArgoCD wiring (`k8s/argocd/`)
 
 ### `appproject.yaml`
-Scopes both `Application`/`ApplicationSet` below to exactly what they use: one source repo, the cluster's own API server as the only allowed destination, the 6 real namespaces (`bookstore` + the 5 backend ones), and a `clusterResourceWhitelist` of exactly 3 kinds — `Namespace`, `StorageClass`, `ClusterSecretStore`. Omitting `clusterResourceWhitelist` entirely denies *all* cluster-scoped resources by default; without these 3 entries, `namespace.yaml` (every tree includes one), `storageclass/gp3.yaml`, and every `ExternalSecret`'s referenced `ClusterSecretStore` would all fail to sync. Applied by Terraform (`kubectl_manifest.argocd_appproject` in `terraform/argocd.tf`) *before* the `Application`/`ApplicationSet` that reference it — this genuinely was a manual-only step for a while and got missed on a from-scratch rebuild, see `TROUBLESHOOTING.md` OBS-058.
+- Limits what the apps can do:
+  - one source repo
+  - one cluster
+  - 6 namespaces (`bookstore` + the 5 service ones)
+  - 3 cluster-wide kinds: `Namespace`, `StorageClass`, `ClusterSecretStore`
+- If you leave out `clusterResourceWhitelist`, **all** cluster-scoped resources are denied.
+- Terraform applies it first (`kubectl_manifest.argocd_appproject`). It was once manual-only and was missed on a full rebuild.
 
 ### `application.yaml`
-The frontend's ArgoCD `Application`. `source.path: k8s/overlays/prod`, `kustomize: {}` (ArgoCD runs `kustomize build` itself, no separate Helm/Jsonnet step). `targetRevision` and `repoURL` are both stamped from `config.env` by `scripts/configure.py` — never hand-edited, since a branch/repo mismatch against what's actually deployed breaks ArgoCD sync outright (`unable to resolve '<branch>' to a commit SHA`). `syncPolicy.automated: { prune: true, selfHeal: true }` — deletes resources removed from git *and* reverts any manual `kubectl edit` back to match git, both directions of drift covered. `retry` backoff (5s → doubling → capped at 3m, 5 attempts) absorbs transient failures (an in-flight secret rotation, a slow-starting dependency) without a human re-triggering sync by hand.
+- The frontend's ArgoCD Application.
+- `source.path: k8s/overlays/prod`, `kustomize: {}` (ArgoCD runs `kustomize build` itself).
+- `targetRevision` and `repoURL` are stamped by `configure.py`. A wrong branch gives `unable to resolve '<branch>' to a commit SHA`.
+- `automated: { prune: true, selfHeal: true }`:
+  - **prune** — delete what you removed from Git.
+  - **selfHeal** — undo manual `kubectl` changes.
+- `retry` with back-off (5s, doubling, up to 3m, 5 tries) absorbs short hiccups like a secret rotating.
 
-**The one thing worth internalizing about this whole GitOps setup:** ArgoCD syncs from the **pushed git branch**, never from local disk. `scripts/configure.py` stamping real values into these files locally does nothing for a live cluster until that commit is actually pushed to `targetRevision`. This tripped up a real apply/destroy cycle test — `configure.py` had run locally, but with nothing pushed, ArgoCD kept applying the placeholder-value manifests from git, and `external-secrets` logs showed a literal `"region":"AWS_REGION_HERE"` in its provider config. Only `argocd.tf`'s own `kubectl_manifest` resources (the `AppProject`, and a couple of bootstrap objects) read local disk directly — every actual workload manifest goes through git first.
+**The one thing to remember about GitOps here:**
+- **ArgoCD syncs from the pushed Git branch. Never from your laptop.**
+- `configure.py` writes real values locally. That does nothing for the cluster until you **push**.
+- This bit a real test run: nothing was pushed, so ArgoCD kept deploying placeholders, and the ESO logs showed `"region":"AWS_REGION_HERE"`.
+- Only `argocd.tf`'s own `kubectl_manifest` resources read local disk. Every real workload goes through Git.
 
 ### `applicationset-microservices.yaml`
-One `ApplicationSet` generating 5 `Application` objects — a `list` generator with one `{service, namespace}` pair per backend service, rather than 5 hand-written `Application` files. Adding a 6th microservice later means adding one list element here, not copy-pasting a whole new `Application` manifest. Template's `source.path: 'k8s/services/{{service}}/overlays/prod'` and `destination.namespace: '{{namespace}}'` interpolate per-generated-Application. Same `syncPolicy`/`retry`/`targetRevision`-stamping pattern as `application.yaml`, same underlying reason each choice was made.
+- One ApplicationSet that makes 5 Applications.
+- A `list` generator with one `{service, namespace}` pair each.
+- Adding a sixth service is **one new list item**.
+- It uses `k8s/services/{{service}}/overlays/prod` and `{{namespace}}`.
 
 ---
 
-## Part 4 — Cross-cutting patterns worth naming once
+## Part 4 — Patterns that repeat everywhere
 
-These show up identically across every tree above; called out once here instead of re-explained per file.
-
-- **Sync-wave ordering**: `ClusterSecretStore` (`-2`) → per-service `ExternalSecret`s (`-1`) → `schema-init-job.yaml` (`0`, implicit) → everything else (`0`, implicit, plain Sync phase). All PreSync hooks run strictly before any Sync-phase resource, in ascending wave order within that phase — getting a wave number wrong doesn't cause an occasional race, it causes a **guaranteed** failure on a from-scratch cluster (see OBS-013, OBS-030 above), because there's no existing state to accidentally paper over the ordering bug.
-- **NetworkPolicy shape**: every namespace gets `default-deny-all` (empty `podSelector`, both policy types) plus exactly one scoped policy per real workload. `ipBlock: 170.20.0.0/16` for anything crossing the ALB or RDS boundary (neither is a pod K8s can label-select); `namespaceSelector` for genuine pod-to-pod traffic within the cluster. Egress to DNS (53/UDP+TCP) is present in literally every policy in this repo — the one rule that's never optional, since without it nothing can even resolve a Service's ClusterIP DNS name.
-- **PDB shape by replica count**: `replicas ≥ 2` → `minAvailable: 1` is safe (frontend, and implicitly api-gateway's 2 replicas — though api-gateway currently has no PDB file of its own, worth noting as a gap against the pattern). `replicas: 1` → must use `maxUnavailable`, never `minAvailable` equal to total replicas, or voluntary disruptions (node drain, node-group upgrade, autoscaler consolidation) hang forever (OBS-049).
-- **Security context floor**: every container in every tree sets `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`, `capabilities.drop: ["ALL"]`, `seccompProfile: RuntimeDefault`, and `automountServiceAccountToken: false` at the pod level (nothing here talks to the K8s API directly). Combined with each namespace's PSS `restricted` label, this is enforced twice over — once at admission (PSS) and once by each manifest's own explicit values (defense in depth, not redundant, since PSS alone wouldn't catch a missing resource request/limit the way `LimitRange` does).
-- **Secrets vs. config split**: `ExternalSecret` → K8s `Secret` → `secretKeyRef` for anything from AWS Secrets Manager (DB creds, JWT secret); plain `ConfigMap` → `configMapKeyRef` for everything else (ports, DB names, internal service URLs, CORS origin). Never mixed in the same source object anywhere in this tree.
-- **What's *not* here**: no `StatefulSet` anywhere (RDS is the only stateful component, and it's Terraform-managed, outside `k8s/` entirely) — no PVC currently claims the `gp3` `StorageClass` despite it being defined. No `ServiceMesh`/sidecar of any kind (Istio, Linkerd) — NetworkPolicy plus the ALB's own TLS termination is the full extent of in-cluster traffic control today, which is exactly the gap [[terraform-explained.md]]'s Part 4 gap-analysis (mTLS/mesh) was written against.
+- **Sync-wave order:** `ClusterSecretStore` (`-2`) → ExternalSecrets (`-1`) → schema-init Jobs (`0`) → everything else (`0`, normal Sync).
+  - A wrong number is not a rare race. On a fresh cluster it is a **guaranteed** failure.
+- **NetworkPolicy shape:** every namespace has `default-deny-all` plus one scoped policy per workload.
+  - `ipBlock` for the ALB and RDS (not pods).
+  - `namespaceSelector` for pod-to-pod.
+  - **DNS (port 53) egress is in every policy.** Without it, nothing can resolve a Service name.
+- **PDB by replica count:**
+  - 2 or more replicas → `minAvailable: 1` is safe.
+  - 1 replica → use `maxUnavailable`, or maintenance hangs.
+- **Security floor on every container:**
+  - `runAsNonRoot: true`
+  - `allowPrivilegeEscalation: false`
+  - `readOnlyRootFilesystem: true`
+  - `capabilities.drop: ["ALL"]`
+  - `seccompProfile: RuntimeDefault`
+  - `automountServiceAccountToken: false` at pod level
+  - Together with the namespace's `restricted` label, it is enforced twice: once at admission and once by the manifest itself.
+- **Secrets vs config:** secrets go `ExternalSecret → Secret → secretKeyRef`. Config goes `ConfigMap → configMapKeyRef`. Never mixed.
+- **What is not here:**
+  - No StatefulSet. RDS is the only stateful part, and Terraform owns it.
+  - No PVC uses the `gp3` class yet.
+  - No service mesh (Istio, Linkerd). NetworkPolicy and the ALB's TLS are all the traffic control today.
 
 ---
-## Apply order (real dependency graph, not directory order)
 
-1. `terraform/argocd.tf` applies the `AppProject` directly (`kubectl_manifest`, reads local disk).
-2. `terraform/argocd.tf` applies `application.yaml` + `applicationset-microservices.yaml` directly, same way.
-3. ArgoCD's own controller takes over from here — polls `targetRevision` every 3 minutes (or reacts instantly to a hard `argocd.argoproj.io/refresh=hard` annotation), runs `kustomize build` against each `source.path`, and reconciles.
-4. Within each Application's sync: `ClusterSecretStore` (wave `-2`) → per-service `ExternalSecret`s (wave `-1`) → `schema-init-job.yaml` Jobs (wave `0`, PreSync) → every remaining plain resource (Deployment, Service, Ingress, NetworkPolicy, HPA, PDB — wave `0`, Sync phase).
-5. `selfHeal: true` means step 3 onward repeats forever, correcting any drift, for the life of the cluster.
+## Apply order (real, not folder order)
 
+1. `terraform/argocd.tf` applies the AppProject (reads local disk).
+2. `terraform/argocd.tf` applies `application.yaml` and `applicationset-microservices.yaml`.
+3. ArgoCD takes over. It checks Git about every 3 minutes, runs `kustomize build` for each path, and reconciles.
+4. Inside each sync: `ClusterSecretStore` (`-2`) → ExternalSecrets (`-1`) → schema-init Jobs (`0`, PreSync) → Deployments, Services, Ingress, NetworkPolicy, HPA, PDB (`0`, Sync).
+5. `selfHeal: true` keeps repeating this forever and fixes any drift.
+
+---
+
+## Quick recap table
+
+| Concept | One-line meaning | Real-time example |
+|---|---|---|
+| Kustomize base / overlay | Shared recipe + small per-environment change | prod overlay sets the image tag |
+| Sync wave | The order ArgoCD applies things | Secret store (`-2`) before secrets (`-1`) |
+| PreSync hook | Runs before the real deploy | schema-init Job creates tables |
+| ExternalSecret | Copies a secret from AWS into the cluster | `order-db-secret` |
+| NetworkPolicy | Firewall between pods | Only `gateway` may call `catalog` |
+| PDB | Limits how many pods can be taken down on purpose | `maxUnavailable: 1` for single-replica services |
+| HPA | Auto-scales pods by load | `order-service` 1 to 5 replicas |
+| Ingress group | Many Ingresses share one ALB | frontend + gateway on one ALB |
+| Self-heal | ArgoCD undoes manual changes | Reverts a hand-edited replica count |
+
+**Easy memory trick:** Secrets first, then the database setup, then the app. Same order every time.
