@@ -218,8 +218,8 @@ In GitHub: **Settings → Secrets and variables → Actions**.
 | `AWS_ACCOUNT_ID` | `aws sts get-caller-identity --query Account --output text` |
 | `AWS_ROLE_ARN` | `terraform output -raw github_oidc_role_arn` (only exists after Step 4) |
 | `API_URL` | `https://api.bookstore.<your-domain>` |
-| `SONAR_TOKEN` | sonarcloud.io → My Account → Security |
-| `SONAR_ORGANIZATION` | your SonarCloud org key |
+| `SONAR_TOKEN` | sonarcloud.io → My Account → Security(access token) |
+| `SONAR_ORGANIZATION` | your SonarCloud org key(devopstrininghub) |
 | `SONAR_PROJECT_KEY` | your SonarCloud project key |
 
 **Variables tab** (not secret — skip it if you use `us-west-1`):
